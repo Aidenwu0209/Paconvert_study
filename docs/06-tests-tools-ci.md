@@ -1,212 +1,65 @@
 # 06. tests、tools、CI 分别在保护什么
 
-如果你只把 `tests/` 看成“跑 pytest 的地方”，会漏掉很多信息。  
-这个仓库实际上有三层保护：
+如果你刚改完一条 mapping，最容易低估的就是这一层：代码能转出来，不等于这次改动已经站住。`tests/`、`tools/` 和 CI 关心的是三个不同的问题，最好分开看。
 
-1. API 行为回归
-2. 源码输出形态回归
-3. 文档、测试规范和提交流程约束
+## `tests/test_*.py`：先卡 API 行为回归
 
-## `tests/` 目录怎么组织
+根目录的 `tests/test_*.py` 是最贴近日常开发的一层。大多数情况就是一文件一个 API，直接围绕某条 mapping 写输入、跑转换、比较结果。
 
-### 根目录 `tests/test_*.py`
+这些测试不是手工拼转换流程，而是走 `tests/apibase.py` 的 `APIBase.run()`。它会把内嵌的 PyTorch 代码先写到临时文件，再调 `Converter` 做真实转换。支持 case 会执行转换前后的代码并比较结果；不支持 case 则会检查输出里是不是出现了 `>>>>>>`。
 
-这是最密的一层。
+所以你改一个 API，第一道回归线通常就落在这里：这条规则在常见调用形态下还能不能转，对明确 unsupported 的输入有没有老老实实打标，而不是静默改坏语义。
 
-当前本地工作树里，根目录 `tests/test_*.py` 文件数是 `1760` 个，这是我在 `2026-04-22` 本地统计到的数字。  
-它的组织方式很朴素：大多数情况就是“一文件一个 API”。
+## `tests/code_library/`：再卡源码文本和大样例
 
-典型特点：
+有些改动不是数值结果先出问题，而是输出代码的形态先漂了。这时就不是 `tests/test_*.py` 一层能完全兜住的。
 
-1. 文件名直接对应 API
-2. 通过 `APIBase` 跑转换和结果比对
-3. 支持 `unsupport=True` 去验证 `>>>>>>` 标记
+`tests/code_library/code_case/` 维护的是一组 `torch_code/...` 和 `paddle_code/...` 的成对文件，配合 `tools/consistency/consistency_check.py` 做逐文件对比。它保护的是“生成出来的源码文本还像不像预期”，而不是运行结果。
 
-### `tests/apibase.py`
+`tests/code_library/model_case/` 则更像大脚本 smoke test，配合 `tools/modeltest/modeltest_check.py` 跑。你可以把它理解成更接近真实项目脚本的一层回归。
 
-这是单测基座。
+所以一个新增 API 不一定每次都要碰 `code_case` 或 `model_case`，但只要你的改动已经影响输出源码结构，或者可能波及更大脚本，就该想到这两层。
 
-它把一个 API 测试拆成固定动作：
+## `validate_unittest`：它查的是测试覆盖面，不是代码对错
 
-1. 把内嵌的 PyTorch 代码临时写到 `test_project/pytorch_temp.py`
-2. 调 `Converter` 做一次真实转换
-3. 如果是支持 case，就执行转换前后的代码并比较结果
-4. 如果是不支持 case，就检查输出里是否出现 `>>>>>>`
+`tools/validate_unittest/validate_unittest.py` 最容易让人误判。pytest 能过，不代表它也会过。
 
-所以你写 `tests/test_xxx.py` 时，很多“怎么调 converter、怎么对比结果”的细活都不用重复写。
+它会记录每个 `APIBase.run(...)` 里真实执行过的调用形态，再回头检查这些测试有没有把一条 mapping 最容易出错的写法覆盖到，比如 `all args`、`all kwargs`、`kwargs out of order`、省略默认参数这些情况。
 
-### helper 文件
+所以你如果只写一个最小 happy path，行为测试也许是绿的，`validate_unittest` 还是会拦你。它保护的是“这条规则以后改动时还有没有足够样本可回归”。
 
-比如：
+## `validate_docs`：它查的是配置和文档有没有漂
 
-1. `tests/optimizer_helper.py`
-2. `tests/lr_scheduler_helper.py`
+`tools/validate_docs/validate_docs.py` 不看代码能不能跑，它看 docs 侧的映射信息和 PaConvert 代码里的 JSON 配置是不是还对得上。
 
-它们的作用不是测试框架，而是把某些 API 需要的固定样板代码抽出来，减少单测文件里的重复。
+这里会交叉比对 `paconvert/api_mapping.json`、`paconvert/attribute_mapping.json`、`paconvert/api_alias_mapping.json` 和 docs 侧导出的 `docs_mappings.json`。`paddle_api`、`kwargs_change`、`args_list` 这些字段一旦改了，文档没同步，往往就是这里先报。
 
-### `tests/code_library/code_case/`
+这也是为什么“我只改了一条 mapping”不一定等于工程闭环已经完成。对维护者来说，配置和文档是两份要一起保的资产。
 
-这块是源码级一致性样例。
+## `tools/consistency`、`modeltest`、`coverage`：它们会在不同位置拦你
 
-它维护一组：
+`tools/consistency/consistency_check.py` 会在你碰输出代码形态时拦你，防止源码级样例和预期文本漂移。  
+`tools/modeltest/modeltest_check.py` 会在更大的模型样例上拦你，防止局部修复引出整段脚本跑不通。  
+`tools/coverage/coverage_diff.py` 则关注覆盖率，防止新增改动没有足够测试兜底。
 
-1. `torch_code/...`
-2. `paddle_code/...`
+这些脚本的意义不一样，但合在一起看，都是在补“单个 API 测试过了也未必够”的那部分空白。
 
-的成对文件，再由 `tools/consistency/consistency_check.py` 批量转换和逐文件比对。
+## CI 和 PR 模板：最后一道公开门面
 
-它保护的不是运行结果，而是“生成的源码文本是不是还长这样”。
+`.github/workflows_origin/` 里当前能直接看到的是 `tests.yml`、`lint.yml`、`coverage.yml`。它们比较薄，主要还是安装依赖，再去调 `make test`、`make lint`、`make coverage`。
 
-### `tests/code_library/model_case/`
+但只看这三个 workflow 不够。`scripts/` 和 `docs/CONTRIBUTING.md` 里还能看到 `consistency`、`modeltest`、`install`、`PRTemplate` 这些检查项。这说明仓库里公开能看到的 GitHub workflow，比维护流程里实际考虑的检查面要窄。
 
-这块更像模型级 smoke test。
+`.github/PULL_REQUEST_TEMPLATE.md` 和 `tools/prTemplate/prTemplate_check.py` 则是另一条线：它们不关心 API 语义，关心的是 PR 描述有没有按仓库要求把 `PR Docs`、`PR APIs` 这些信息写完整。
 
-`tools/modeltest/modeltest_check.py` 会把这些模型脚本转成 Paddle，再尝试直接运行。
+## 一个新增 API 的 PR，通常会在哪些地方挂
 
-它保护的是“在更像真实项目的脚本里，改动有没有带来大面积失效”。
+最常见的几类问题其实很稳定。
 
-### 其他子目录
+1. `tests/test_<api>.py` 只写了最小用例，`validate_unittest` 认为覆盖不够。
+2. `args_list`、`kwargs_change` 改了，但 docs 侧没同步，`validate_docs` 先报。
+3. 改动影响了输出代码文本，却没补 `tests/code_library/code_case/`，`consistency` 对不上。
+4. 测试本身补得少，`coverage` 过不去。
+5. PR 描述没按模板写，`prTemplate` 这一层会拦。
 
-像：
-
-1. `tests/distributed/`
-2. `tests/flash_attn_tests/`
-
-说明仓库里还保留了一些专题子集，不全都走“根目录一文件一个 API”的模式。
-
-## `tools/` 目录里几类工具分别干什么
-
-当前 `tools/` 下面我实际看到这些子目录：
-
-1. `codestyle`
-2. `consistency`
-3. `coverage`
-4. `docker`
-5. `modeltest`
-6. `prTemplate`
-7. `validate_docs`
-8. `validate_unittest`
-
-可以粗分成 4 类。
-
-### 1. 规则正确性
-
-1. `tools/validate_unittest/validate_unittest.py`
-2. `tools/validate_docs/validate_docs.py`
-
-前者管测试规范，后者管文档和配置一致性。
-
-### 2. 结果形态回归
-
-1. `tools/consistency/consistency_check.py`
-2. `tools/modeltest/modeltest_check.py`
-
-前者看源码级 diff，后者看模型脚本能不能跑。
-
-### 3. 流程质量门
-
-1. `tools/coverage/coverage_diff.py`
-2. `tools/prTemplate/prTemplate_check.py`
-
-一个看增量覆盖率，一个看 PR 描述模板。
-
-### 4. 环境与辅助
-
-1. `tools/docker/`
-2. `tools/codestyle/`
-
-这些更多是给脚本和 CI 用。
-
-## `validate_unittest` 在看什么
-
-它最关键的逻辑在 `tools/validate_unittest/validate_unittest.py`。
-
-不是简单“跑不跑得过”，而是收集每个 `APIBase.run(...)` 里真实执行过的调用代码，再回头检查：
-
-1. 有没有 `all args`
-2. 有没有 `all kwargs`
-3. 有没有 `kwargs out of order`
-4. 有没有“省略默认参数”的 case
-
-也就是说，它管的是“这个 API 的测试有没有把 mapping 里最容易出错的参数形态覆盖到”。
-
-所以你写一个只有单 happy path 的测试文件，很可能 pytest 能过，但 `validate_unittest` 仍然会报。
-
-## `validate_docs` 在对齐什么
-
-`tools/validate_docs/validate_docs.py` 会拿 docs 侧导出的 `docs_mappings.json`，和 PaConvert 代码里的：
-
-1. `paconvert/api_mapping.json`
-2. `paconvert/attribute_mapping.json`
-3. `paconvert/api_alias_mapping.json`
-
-做交叉检查。
-
-它关注的是：
-
-1. `paddle_api` 是否一致
-2. `kwargs_change` 是否一致
-3. `args_list` 是否一致
-4. 有没有 matcher 已存在，但文档缺失
-
-注意一个现实问题：  
-如果你只在本仓库改代码，没有同步准备 docs 侧的映射数据，`validate_docs` 这条线不一定能自动“绿掉”。
-
-## CI / PR 模板相关目录是干什么的
-
-### `.github/PULL_REQUEST_TEMPLATE.md`
-
-这里约束的是 PR 描述结构，不是代码逻辑。  
-模板要求至少写：
-
-1. `PR Docs`
-2. `PR APIs`
-
-`tools/prTemplate/prTemplate_check.py` 和 `scripts/PRTemplate_check.sh` 都在围绕这个模板做检查。
-
-### `.github/workflows_origin/`
-
-当前仓库里能直接看到 3 个 workflow 文件：
-
-1. `tests.yml`
-2. `lint.yml`
-3. `coverage.yml`
-
-它们很轻：
-
-1. 安装依赖
-2. 调 `make test` / `make lint` / `make coverage`
-
-### `scripts/`
-
-这里是另一层更完整的检查脚本集合。  
-我实际确认到的文件包括：
-
-1. `scripts/unittest_check.sh`
-2. `scripts/code_style_check.sh`
-3. `scripts/code_coverage_check.sh`
-4. `scripts/consistency_check.sh`
-5. `scripts/modeltest_check.sh`
-6. `scripts/install_check.sh`
-7. `scripts/PRTemplate_check.sh`
-8. `scripts/run_ci.sh`
-
-跟 `.github/workflows_origin/` 对比着看，能发现一个事实：
-
-1. visible GitHub workflow 只覆盖了其中一部分
-2. 仓库维护流程里实际考虑的检查项比公开 workflow 文件更多
-
-## 一个新增 API 的 PR 通常要自查什么
-
-我会按这个顺序自查：
-
-1. `api_mapping.json` 的 `args_list`、`kwargs_change`、`unsupport_args`、`paddle_default_kwargs` 有没有和我想表达的语义一致
-2. `tests/test_<api>.py` 里有没有最小支持 case、全 kwargs、乱序 kwargs、默认参数省略 case
-3. 如果有不支持边界，是否显式写了 `unsupport=True`
-4. 如果改动会影响源码形态，是否补了 `tests/code_library/code_case/`
-5. 如果改动更像大样例回归风险，是否看过 `model_case`
-6. `validate_unittest` 会不会因为测试样态单一而报
-7. `validate_docs` 会不会因为参数名或签名漂移而报
-8. PR 描述里有没有把 `PR Docs` 和 `PR APIs` 写完整
-
-把这 8 项过一遍，基本已经不是“只改了一条 JSON”这种局部视角，而是完整工程闭环视角了。
+所以从开发动作上看，`tests`、`tools`、CI 不是三块并列目录，而是一条逐步收紧的防线：先查 API 行为，再查覆盖面和文档对齐，最后查更大样例和提交流程。

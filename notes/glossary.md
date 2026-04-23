@@ -26,7 +26,7 @@
 
 ## Canonical Torch API
 
-这里我用它指“补全 import 别名并做 alias 归一化之后的 API 全名”。例如 `F.relu` 会先还原成 `torch.nn.functional.relu`；如果命中 alias，再继续归到真正做 mapping 的那一项。
+这里指“补全 import 别名并做 alias 归一化之后的 API 全名”。例如 `F.relu` 会先还原成 `torch.nn.functional.relu`；如果命中 alias，再继续归到真正做 mapping 的那一项。
 
 ## Import 分析
 

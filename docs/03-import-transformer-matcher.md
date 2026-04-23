@@ -1,234 +1,71 @@
 # 03. import、transformer、matcher 是怎么分工的
 
-如果把 PaConvert 的主流程只压成一句话，大概是：
+`docs/02` 已经把主流程走完了。这里不再重讲目录扫描和输出，只盯 AST 链中间最容易混掉的三层：import 恢复、`BasicTransformer` 分发、matcher 生成代码。
 
-先把“这个名字到底是谁”搞清楚，再决定“该交给哪个规则改写”。
+## import 这一步到底在解决什么
 
-前半句主要是 `ImportTransformer` 和 `BaseTransformer`。后半句主要是 `BasicTransformer`、`BaseMatcher` 和具体 matcher。
+`ImportTransformer` 先解决的是“这个名字到底是谁”。不把这件事做完，后面根本谈不上 stable mapping。
 
-## import 分析为什么重要
+问题的根源很直接：源码里真实出现的往往不是完整 API 名，而是各种局部写法。`import torch as th`、`import torch.nn as nn`、`from torch.nn import functional as F`、`from torch.nn import Linear` 都只把一部分信息留在调用点。你看到的可能是 `th.add(...)`、`nn.Linear(...)`、`F.relu(...)`、`Linear(...)`，甚至再混进本地相对导入和普通第三方包。
 
-不先做 import 分析，后面很多调用根本无从判断。
+`ImportTransformer` 做的事不是“马上把 API 改成 Paddle”，而是先把这些名字放回正确语境里。对照 `tests/code_library/code_case/torch_code/import_analysis.py` 和 `tests/code_library/code_case/paddle_code/import_analysis.py` 看，会更容易理解它为什么要先区分 `torch_packages`、`may_torch_packages` 和 `other_packages`。
 
-最常见的几种情况：
+## canonical API 是怎么恢复出来的
 
-1. `import torch as th`
-2. `import torch.nn as nn`
-3. `from torch.nn import functional as F`
-4. `from torch.nn import Linear`
-5. `from .datasets import x`
-6. `import datasets`
+这件事分两步。
 
-对新人最有帮助的例子是 `tests/code_library/code_case/torch_code/import_analysis.py`。  
-它把“本地相对导入”和“应该被认成 torch 生态的包”混着放在同一个文件里。对应的期望输出在 `tests/code_library/code_case/paddle_code/import_analysis.py`。
+第一步是 import 层的补全。`BaseTransformer.get_full_api_from_node()` 会先看当前节点最左边的名字，比如 `F.relu` 里的 `F`、`nn.Linear` 里的 `nn`、`Linear(...)` 里的 `Linear`。如果这个名字能在 `imports_map[file]` 里找到，就替换成完整前缀。
 
-`ImportTransformer` 在这里做的不是“立刻改成 Paddle API 调用”，而是先把三类东西分开：
+第二步是 alias 层的归一。补全后的完整名字还可能再过一次 `GlobalManager.ALIAS_MAPPING`，也就是 `paconvert/api_alias_mapping.json`。比如 `torch.absolute` 会归到 `torch.abs`，`torch.arccos` 会归到 `torch.acos`。所以文档里说的 canonical API，实际指的是“import 已补全、alias 也已归一”之后那个最终名字。
 
-1. `torch_packages`
-2. `may_torch_packages`
-3. `other_packages`
+后面的 mapping 查询，都是拿这个名字去查。
 
-后面 `BasicTransformer` 会用这些信息避免误判。
+## `BasicTransformer` 是什么时候介入的
 
-## canonical torch API 名是怎么恢复出来的
+`ImportTransformer` 跑完之后，`Converter.transfer_node()` 才会继续进 `BasicTransformer`。这就是为什么它必须排在 import 之后：`BasicTransformer` 接到的输入，应该已经是能稳定还原出 canonical API 的 AST 节点，而不是一堆模糊别名。
 
-这件事实际分两层。
+`BasicTransformer` 关心三类东西：包级调用、类方法调用、属性访问。它会在遍历 AST 时判断当前节点属于哪一类，再按 canonical API 去查 `paconvert/api_mapping.json`、`paconvert/attribute_mapping.json` 或 wildcard mapping。
 
-### 第一层：import 别名恢复
+它本身不负责写具体转换代码，真正的工作更像调度：识别节点类型、恢复 API 名、挑 matcher、把 matcher 产出的结果插回当前作用域。
 
-`BaseTransformer.get_full_api_from_node()` 会先看当前节点的最左侧名字，比如：
+## matcher 接到的是什么，吐出的又是什么
 
-1. `F.relu` 里的 `F`
-2. `nn.Linear` 里的 `nn`
-3. `Linear(...)` 里的 `Linear`
+matcher 接到的核心输入有三样：
 
-如果这个名字能在 `imports_map[file]` 里找到，就替换成完整前缀。
+1. 当前节点对应的 canonical API
+2. 这条 API 在 mapping 里的配置
+3. 当前 AST 作用域和辅助上下文，比如 `self.paddleClass`
 
-结果会变成类似：
+拿到这些之后，matcher 才开始做自己擅长的那一层：参数归一化、参数改名、删参、补默认值、判断 unsupported、必要时登记 helper 代码。
 
-1. `F.relu` -> `torch.nn.functional.relu`
-2. `nn.Linear` -> `torch.nn.Linear`
-3. `Linear` -> `torch.nn.Linear`
+matcher 产出的本质不是“一个字符串”这么简单，而是一段要插回 AST 的结果。有时是一句函数调用；有时是多句辅助语句加最后一个表达式；再复杂一点，还会顺带登记 `paddle_utils.py` 里要落的 helper。
 
-### 第二层：alias mapping 归一
+所以 transformer 和 matcher 的交界线可以记成这样：transformer 决定“谁来改”，matcher 决定“改成什么样”。
 
-补全成完整名字之后，还可能再查一次 `GlobalManager.ALIAS_MAPPING`，也就是 `paconvert/api_alias_mapping.json`。
+## 什么时候只是改前缀，什么时候要改参数
 
-这里处理的是“同一类 API 的别名入口”，比如当前仓库里可以直接查到：
+`torch.add` 这种场景就是最典型的“只改前缀”。`paconvert/api_mapping.json` 里只写 `Matcher = ChangePrefixMatcher`，然后由 `ChangePrefixMatcher` 把最左边的 `torch` 改成 `paddle`。参数结构基本原样保留。
 
-1. `torch.absolute -> torch.abs`
-2. `torch.arccos -> torch.acos`
-3. `torch.Tensor.absolute -> torch.Tensor.abs`
+`torch.optim.SGD` 就不是这样了。它会进 `GenericMatcher`：先用 `BaseMatcher.parse_args_and_kwargs()` 把位置参数归一化成命名参数，再按 `kwargs_change` 改名，最后按 `paddle_default_kwargs` 补默认值。这一层已经不是“换个前缀”能说清的了。
 
-所以文中说的 canonical torch API，实际指的是：
+真正再往上一层的复杂度，是需要 helper 或多行代码的时候。比如某些专用 matcher 不会只返回一句调用，而是要引入临时变量、拼多句代码，再由 `BaseTransformer.insert_multi_node()` 把辅助语句插回当前作用域。看到这种需求时，就别再试图只靠 JSON 把问题描述完。
 
-1. import 别名已经补全
-2. alias mapping 也已经归一
+## `BaseMatcher.parse_args_and_kwargs()` 为什么这么关键
 
-之后再去查 `api_mapping.json` / `attribute_mapping.json`。
+很多人第一次看 `api_mapping.json` 时，会把注意力都放在 `paddle_api` 上，反而漏掉 `args_list`。但对 `GenericMatcher` 这类规则来说，`args_list` 才是把位置参数解释对的前提。
 
-## transformer 各自负责什么
+`BaseMatcher.parse_args_and_kwargs()` 会按 `args_list` 给位置参数命名，再把源码里本来就是关键字参数的部分并进同一个 `kwargs`。如果遇到 `unsupport_args` 且用户真的传了，就直接走 unsupported；如果传入形态和 mapping 声明对不上，还可能落到 `misidentify`。
 
-### `ImportTransformer`
+`args_list` 里出现 `"*"` 也不是装饰，它表示后面的参数必须按 keyword 形式出现。`torch.optim.SGD` 就靠这个把 `maximize`、`foreach`、`differentiable`、`fused` 划到了 keyword-only 区间。
 
-文件：`paconvert/transformer/import_transformer.py`
+## 这三层的真实顺序，不要记反
 
-职责：
-
-1. 扫 import / from-import
-2. 记录别名到完整前缀的映射
-3. 记录非 torch 包名，供黑名单使用
-4. 把局部写法补成完整 API 名
-5. 在模块头部补回 `import paddle`
-
-它做的是“识别前置处理”，不是最终 API 语义改写。
-
-### `BasicTransformer`
-
-文件：`paconvert/transformer/basic_transformer.py`
-
-职责：
-
-1. 识别包级调用
-2. 识别类方法调用
-3. 识别属性访问
-4. 查 mapping
-5. 实例化 matcher
-6. 把 matcher 生成的 AST 节点插回当前作用域
-
-它才是“主转换器”。
-
-### `PreCustomOpTransformer`
-
-文件：`paconvert/transformer/custom_op_transformer.py`
-
-职责：
-
-1. 预扫描 C++ extension import
-2. 记录哪些 `autograd.Function` 类和自定义扩展关联
-
-### `CustomOpTransformer`
-
-同文件后半段。
-
-职责：
-
-1. 把 `AutogradFunc.apply` 这类壳子调用改成扩展模块调用
-2. 同时插入“不支持自动转换 C++ 部分”的提示
-
-### `TensorRequiresGradTransformer`
-
-文件：`paconvert/transformer/tensor_requires_grad_transformer.py`
-
-它的职责很明确：专门改 `tensor.requires_grad = ...` 左值赋值。  
-但当前 `Converter.transfer_node()` 没有把它加入默认链路。
-
-这里不能写成“它现在也会参与主流程”。实际源码里不是这样。
-
-## matcher 负责什么
-
-transformer 的工作到“识别出一个 API，并确定它应该交给哪个 matcher”就差不多结束了。  
-真正决定输出代码长什么样的是 matcher。
-
-matcher 主要做四件事：
-
-1. 参数归一化
-2. 参数改名 / 删参 / 补默认值
-3. 生成目标 Paddle 代码字符串
-4. 必要时生成额外的辅助语句或 helper 函数
-
-举几个最常见的 matcher：
-
-1. `ChangePrefixMatcher`
-   - 只改包名前缀
-   - 典型例子：`torch.add -> paddle.add`
-2. `ChangeAPIMatcher`
-   - 只改 API 名，不动参数结构
-3. `GenericMatcher`
-   - 最常见
-   - 能做参数归一化、改名、补默认值、处理 `out` / `requires_grad`
-4. 一些专用 matcher
-   - 比如 `SliceScatterMatcher`、`TransposeMatcher`
-   - 会直接生成多行代码
-
-## 位置参数 / 关键字参数如何被归一化
-
-核心逻辑在 `BaseMatcher.parse_args_and_kwargs()`。
-
-它依赖 mapping 里的几个字段：
-
-1. `args_list`
-2. `min_input_args`
-3. `unsupport_args`
-4. 可选的 `overload_args_list`
-
-它的工作方式可以简单理解成：
-
-1. 先用 `args_list` 给位置参数按顺序命名。
-2. 再把源码里本来就是关键字参数的部分并到同一个 `kwargs` 字典里。
-3. 如果遇到 `unsupport_args` 且用户真的传了，就直接返回不支持。
-4. 如果传入形态和 mapping 声明不一致，比如关键字名根本不在 `args_list` 里，就返回 `misidentify`。
-
-`args_list` 里还有个容易忽略的约定：  
-如果出现 `"*"`，表示它后面的参数必须用 keyword 形式出现。
-
-`torch.optim.SGD` 就是很典型的例子：
-
-1. `args_list` 先列 `params, lr, momentum, dampening, weight_decay, nesterov`
-2. 再用 `*` 把后面的 `maximize, foreach, differentiable, fused` 划成只能 keyword 的参数
-
-## 为什么有些 API 能一对一替换，有些要生成多行代码
-
-### 一对一替换
-
-这类最省心。
-
-典型情况：
-
-1. API 名和参数结构几乎一样
-2. 不需要引入辅助变量
-3. 不需要根据上下文插额外语句
-
-`torch.add -> paddle.add` 就是这种。
-
-### 多行代码
-
-多行通常来自三种需求：
-
-1. Paddle 侧没有完全对等的单 API，要用多句组合出来。
-2. 需要引入临时变量，避免重复求值。
-3. 需要保留 `out=`、`requires_grad=` 这类 PyTorch 语义。
-
-`GenericMatcher.generate_code()` 本身就可能把一行变多行。  
-比如同时出现 `out` 和 `requires_grad` 时，它会生成 `paddle.assign(...)` 加属性赋值，不再是一句简单函数调用。
-
-更复杂的专用 matcher 会直接拼多句模板，然后靠 `BaseTransformer.insert_multi_node()` 把前面的辅助语句插回当前作用域，把最后一个表达式替回原调用点。
-
-## 实际顺序到底是不是“我以为的那样”
-
-当前源码里，默认顺序是：
+当前默认顺序就是：
 
 1. `ImportTransformer`
 2. `BasicTransformer`
-3. `PreCustomOpTransformer`
-4. `CustomOpTransformer`
+3. 具体 matcher
 
-不是：
+不是所有 `transformer/` 目录里的文件都会自动执行，也不是 matcher 先跑、再回头看 import。`mark_unsupport()` 更不在这一层，它是在 AST 回写成源码之后才统一打 `>>>>>>`。
 
-1. 所有 `transformer/` 目录里的文件都会执行
-2. `matcher` 先跑，再决定 import
-3. `mark_unsupport()` 在 transformer 里面直接打 `>>>>>>`
-
-这三个都是常见误读。
-
-## 这一层读代码时最值得盯住的文件
-
-1. `paconvert/base.py`
-2. `paconvert/transformer/import_transformer.py`
-3. `paconvert/transformer/basic_transformer.py`
-4. `paconvert/api_mapping.json`
-5. `paconvert/api_alias_mapping.json`
-6. `paconvert/api_matcher.py`
-
-如果你只打算改一个普通 API 映射，通常不会先改 transformer。  
-大多数时候真正要动的是 `api_mapping.json`、`api_matcher.py` 和对应测试。
+如果你只打算改一个普通 API，读代码时最值得盯住的还是这几处：`paconvert/base.py`、`paconvert/transformer/import_transformer.py`、`paconvert/transformer/basic_transformer.py`、`paconvert/api_mapping.json`、`paconvert/api_alias_mapping.json`、`paconvert/api_matcher.py`。多数情况下，真正要动的还是 mapping、matcher 和对应测试。

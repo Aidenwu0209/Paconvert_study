@@ -1,130 +1,69 @@
 # 08. 已知限制和容易误判的点
 
-这一篇不讲“应该怎么设计”，只讲“你读源码或看输出时，哪些现象别先下结论”。
+这页只收读源码和看输出时最容易误判成 bug 的现象。每一条都尽量落到“你会看到什么，为什么会这样”。
 
-## 为什么第三方库封装的 torch API 不一定能自动转
+## 看到你自己封装的函数没改，不一定是漏转
 
-PaConvert 识别的是当前文件 AST 里能还原成 torch 生态前缀的调用。
+常见现象是：当前文件里只写了 `my_add(x, y)`，而 `my_add()` 的实现藏在别的模块里，里面再去调 `torch.add()`。这种情况下，PaConvert 往往不会自动把 `my_add()` 也识别成待转换 API。
 
-它比较擅长的情况是：
+原因不在 matcher，而在识别边界。当前主流程主要看“当前文件 AST 里能不能恢复出 torch 生态前缀”，不会跨包做更深的静态分析。所以 `torch.xxx`、`nn.xxx`、`F.xxx` 这类直接写在当前文件里的调用比较稳；项目自己再封一层，自动识别的把握就会明显下降。
 
-1. `torch.xxx`
-2. `nn.xxx`
-3. `F.xxx`
-4. `torchvision.xxx`
-5. `mmcv.xxx`
-6. 其他在 `GlobalManager.TORCH_PACKAGE_MAPPING` 里显式列出来的包前缀
+## 看到 import 顺序、空行、拆行都变了，不是 formatter 失控
 
-它不擅长的情况是：
+常见现象是：转换后逻辑没什么变化，但 import 顺序重排了，长调用被拆行了，空行位置也和原文件不同。
 
-1. 你项目自己封了一层 `my_add()`，里面再调用 `torch.add()`
-2. 第三方库内部帮你调了 torch，但当前文件里只看到一个普通函数名
-3. import 名字根本不在 `TORCH_PACKAGE_MAPPING` / `MAY_TORCH_PACKAGE_LIST` 里
+这来自固定输出链：`astor.to_source()` 先把 AST 回写成源码，后面默认还会接 `black` 和 `isort`。所以代码风格变化不是额外插件“多管闲事”，而是 `Converter.transfer_file()` 的默认行为。
 
-这不是简单的 bug，更像能力边界。  
-它看的是 AST 节点和 import 前缀，不会跨包做静态分析。
+## 看到注释没了，先别怀疑 matcher
 
-## 为什么转换后代码风格可能变化
+最典型的现象是：业务调用都改对了，但行注释不见了，原来手工排版的细节也保不住。
 
-因为当前输出链路就是：
+原因很直接：Python AST 不保留普通注释，回写又走的是 `astor.to_source()`。文档字符串还能留下，是因为它本来就是字符串字面量节点；普通注释则没有这层待遇。
 
-1. `astor.to_source()`
-2. `black`
-3. `isort`
+## 看到输出多了几行，或者多了 `paddle_utils.py`，先看是不是设计使然
 
-这会直接带来这些结果：
+这类现象通常有三种来源。第一种是 matcher 本来就需要多句代码才能表达一个 API；第二种是 matcher 引入了临时变量；第三种是 matcher 通过 `BaseMatcher.enable_utils_code()` 登记了 helper，于是任务结束后由 `UtilsFileHelper.write_code()` 统一落成 `paddle_utils.py` 或插回当前文件。
 
-1. import 顺序变了
-2. 空行变了
-3. 长调用被拆行了
-4. 一些括号风格变了
+所以“多出几行”不自动等于规则错了。很多时候只是目标 API 没法一对一替换，当前设计选择了更显式的展开方式。
 
-这不是额外 formatter 插件“多管闲事”，而是 `Converter.transfer_file()` 的默认行为。
+## 看到 `>>>>>>`，它表示这段调用被保守地留了下来
 
-## 为什么注释可能消失
+`>>>>>>` 不是 matcher 当场拼进去的文本，而是 `Converter.mark_unsupport()` 在源码输出最后一层统一加上的。通常是前面某个 transformer 或 matcher 已经判断这段调用不该自动改，先插入一条 `'Not Support auto convert ...'` 提示语句，最后再由 `mark_unsupport()` 给真实业务代码那一行打标。
 
-因为 Python AST 本身不保留普通注释，回写又走的是 `astor.to_source()`。
+所以看到 `>>>>>>` 时，更接近的理解是“这段调用被显式保留，等人手工接管”，而不是“系统半改半没改，状态不明”。
 
-所以：
+## summary 数字比你预想的大，通常只是统计口径不同
 
-1. 行注释基本会丢
-2. 原始排版里的很多细节也不会保留
-3. 文档字符串能保留，是因为它们本身是字符串字面量节点
+最常见的误会是拿文件数去对照 `convert_rate`。实际上 summary 统计的是识别到的 torch API 次数，不是文件数。
 
-如果你在 diff 里看到“逻辑没怎么变，但注释没了”，先别怀疑 matcher。
+比如 `examples/simple_add/input_torch.py` 里除了 `torch.add(...)`，还有两个 `torch.tensor(...)`。所以同一个小文件，summary 看到的是 3 个 API，而不是 1 个文件。
 
-## 为什么有些代码会多出几行
+## 名字很像的 API，不一定走同一条规则
 
-常见来源有 4 种：
+`torch.add(...)` 和 `x.add(...)` 很容易被看成一回事，但在当前仓库里它们不是同一条链路。前者是包级函数，当前走 `ChangePrefixMatcher`；后者是类方法，会走 `BasicTransformer` 的类方法分支，再命中别的 matcher。
 
-1. matcher 需要多句组合实现一个 API
-2. matcher 需要插入临时变量
-3. matcher 需要 helper 函数，于是触发 `paddle_utils.py`
-4. 不支持自动转换时，transformer 会先插入提示节点，后面再由 `mark_unsupport()` 把业务代码那一行打上 `>>>>>>`
+所以如果你只凭 API 名字搜一圈就下结论，很容易把“规则不一致”误判成 bug。先确认它到底是包级调用、类方法还是属性访问。
 
-所以“多出几行”不一定代表规则错了，有时只是实现方式本来就不是一对一替换。
+## 文件存在，不等于默认一定会参与主流程
 
-## `>>>>>>` 标记代表什么
+`paconvert/transformer/tensor_requires_grad_transformer.py` 就是最典型的例子。它的职责很明确，专门处理 `tensor.requires_grad = ...` 左值赋值；但当前 `Converter.transfer_node()` 默认并没有把它接进 transformer 链。
 
-它不是 matcher 直接拼进去的文本，而是 `Converter.mark_unsupport()` 在源码输出最后一层加上的。
+这件事源码能直接确认，所以读代码时别把“仓库里有这个文件”自动理解成“这次转换一定会跑到它”。
 
-它主要有两种触发来源：
+## 只有 `requirements.txt` 被特殊处理，别的配置文件不会顺手跟着改
 
-1. `BasicTransformer` / `CustomOpTransformer` 先插入一条 `'Not Support auto convert ...'` 提示语句
-2. `mark_unsupport()` 再把后面的真实业务代码行前面加上 `>>>>>>`
+你可能会看到这样的现象：Python 源码里的 `torch` 调用已经改了，但 `pyproject.toml`、`setup.cfg`、YAML、shell 脚本里的依赖声明原封不动。
 
-还有一个细节值得知道：  
-`mark_unsupport()` 会先尽量把字符串字面量剔掉，再判断有没有残留 `torch.` 前缀，所以不会把普通文案字符串里的 `torch` 全都误标红。
+这不是漏掉了某个 formatter。当前代码只对文件名以 `requirements.txt` 结尾的文件做简单替换，其他非 Python 文件基本就是原样复制。
 
-## 哪些地方最容易误以为“这是 bug”，但其实更像设计取舍
+## 可见的 GitHub workflow，比实际维护检查少
 
-### 1. Convert Rate 不是按文件算
+如果你只看 `.github/workflows_origin/`，当前能直接看到的是 `tests.yml`、`lint.yml`、`coverage.yml`。但 `scripts/` 和 `docs/CONTRIBUTING.md` 里还能找到 `modeltest`、`consistency`、`install`、`PRTemplate` 这些检查项。
 
-它按识别到的 API 次数算。
+所以“仓库里只挂了三条 workflow”不等于维护流程里真的只做这三类检查。读 CI 相关代码时，最好把 `.github/` 和 `scripts/` 放在一起看。
 
-所以一个文件里有两个 `torch.tensor` 和一个 `torch.add`，summary 看到的就是 3 个 API，不是 1 个文件。
+## 这两个点我选择继续明确标 `不确定`
 
-### 2. `torch.add` 和 `x.add` 不是同一条规则
+当前工作区同时存在 `./PaConvert` 和 `./paconvert`，而且内容一致；但打包入口写的是 `paconvert.main:main`，所以正文统一用小写路径。这个结论能确认，至于历史上为什么会同时保留两套目录名，现有文件给不出答案。
 
-名字很像，但一个是包级函数，一个是类方法。  
-前者当前走 `ChangePrefixMatcher`，后者会走类方法分支和别的 matcher。
-
-### 3. `tensor_requires_grad_transformer.py` 存在，不等于默认一定会跑
-
-当前默认 transformer 链里没有它。  
-这是源码能直接确认的事实，不该写成“应该会走但可能失效”。
-
-### 4. 只有 `requirements.txt` 被特殊处理
-
-当前代码只对文件名以 `requirements.txt` 结尾的文件做简单替换。  
-别的配置文件、YAML、shell、TOML 都是按原样复制。
-
-### 5. visible GitHub workflow 不等于全部维护检查
-
-`.github/workflows_origin/` 里现在只看得到 `tests`、`lint`、`coverage` 三个 workflow。  
-但 `scripts/` 和 `docs/CONTRIBUTING.md` 还提到 `modeltest`、`consistency`、`install`、`PRTemplate` 等脚本。
-
-如果你只看 `.github/workflows_origin/`，会误以为仓库检查面比实际窄。
-
-### 6. “不支持”通常是显式保留，不是偷偷降级
-
-像 `torch.optim.SGD` 带 `momentum`、`dampening` 这些参数时，当前实现不是静默丢参，而是保留原调用并打 `>>>>>>`。
-
-这比“假装支持，实际语义偷偷变了”更保守。
-
-## 还有两个我选择明确标出来的地方
-
-### `paconvert` 和 `PaConvert` 目录名
-
-这次本地读取时同时存在：
-
-1. `./PaConvert`
-2. `./paconvert`
-
-而且我实际比对过，两者当前内容一致。  
-但打包入口用的是小写 `paconvert.main:main`，所以正文统一用小写路径。
-
-### `TensorRequiresGradTransformer` 为什么没接进默认链路
-
-这件事当前源码里能看到结果，看不到决策原因。  
-我在别处都只写了“默认链路没有启用它”，没有继续猜“为什么后来废弃”。
+`TensorRequiresGradTransformer` 为什么没接进默认链路也一样。源码能确认“现在没接”，不能只靠现有仓库文件确认“后来为什么不用它”。
