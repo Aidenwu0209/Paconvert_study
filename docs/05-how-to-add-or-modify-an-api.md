@@ -1,81 +1,54 @@
-# 05. 新增或修改一个 API 映射，最小闭环是什么
+# 05. 新增或修改一个 API
 
-加一个 API 时，先别想着“我要写哪段代码”，先判断这条规则落在哪一层。大多数需求只会停在 `paconvert/api_mapping.json`；少数会继续落到 matcher；再少数才需要动 transformer。
+先判断问题落在识别层还是规则表达层。调用已经能被 `BasicTransformer` 识别，只是要换 API 名、改参数名、补默认值，就先看 `paconvert/api_mapping.json`；完整 API 名都恢复不出来，才去 `paconvert/transformer/`。
 
-## 先判断：这是 mapping 问题，还是识别问题
+## 1. 看调用有没有被识别
 
-第一眼先看调用长什么样。它是包级函数、类方法，还是属性访问？它是单纯换名字，还是参数语义也要变？它有没有明确的不支持边界？这三个判断会直接决定你下一步打开哪个文件。
+先找 `tests/test_<api>.py` 或同类测试，看输入长什么样。包级函数、类方法、属性访问走的分支不一样，`torch.add(...)` 和 `x.add(...)` 就不能混成一条规则。
 
-如果调用已经能被 `BasicTransformer` 识别出来，只是要换目标 API、改参数名、补默认值，那就先去 `paconvert/api_mapping.json`。如果你已经发现“这个 API 连完整名都恢复不出来”或者“import 阶段就认错包了”，那才是 transformer 层的问题。
+`BasicTransformer` 能拿到 canonical API 时，下一步看 mapping。`import torch as th`、`from torch.nn import functional as F` 这种 alias 没恢复成功时，回到 `paconvert/transformer/import_transformer.py` 和 `paconvert/base.py` 查 `imports_map[file]`。
 
-## 动手时先开哪几个文件
+属性访问也要先分清。`x.device`、`tensor.T` 不走普通 `Call`，类方法还会受 `self.paddleClass` 影响。入口判断错了，后面改 JSON 会一直没命中。
 
-推荐顺序不是从 `api_matcher.py` 顶部往下翻，而是先找同类样板。
+## 2. mapping 能表达就别写 matcher
 
-1. 先看 `tests/test_<api>.py`，确认仓库里有没有现成测试，顺便看这个 API 平时怎么写。
-2. 再看 `paconvert/api_mapping.json`，找同类 API 现在怎么配。
-3. 如果 mapping 看起来不够表达，再去 `paconvert/api_matcher.py` 找能不能复用已有 matcher。
-4. 只有你开始怀疑参数归一化、helper 注入或者 AST 识别边界时，才继续往 `paconvert/base.py`、`paconvert/transformer/basic_transformer.py`、`paconvert/transformer/import_transformer.py` 里钻。
+`paconvert/api_mapping.json` 能覆盖很多普通改动：`Matcher`、`paddle_api`、`args_list`、`min_input_args`、`kwargs_change`、`unsupport_args`、`paddle_default_kwargs`。
 
-这个顺序的好处是，你会先知道“现有体系打算怎么表达这类规则”，而不是一上来就被大文件淹没。
+只改前缀，用 `ChangePrefixMatcher`，`torch.add` 是例子。只改 API 名，看 `ChangeAPIMatcher`。位置参数要按 `args_list` 归一化、再改参数名或补默认值，看 `GenericMatcher`，`torch.optim.SGD` 是例子。
 
-## 什么时候只改 `api_mapping.json`
+`unsupport_args` 也属于 mapping 能表达的范围。某些参数不能安全转换时，优先在 JSON 里写清边界，再用 `tests/test_<api>.py` 的 `unsupport=True` 固定输出行为。
 
-如果需求能完全落在现有字段里，先别新写 matcher。典型情况有三种。
+`args_list` 要和测试调用形态一起看。位置参数顺序、`*` 后 keyword-only 参数、`min_input_args` 都会影响 `BaseMatcher.parse_args_and_kwargs()` 的判断；测试只覆盖一种写法时，mapping 很容易看起来“能跑”，但边界不稳。
 
-第一种是单纯改前缀，比如 `torch.add` 这种 `ChangePrefixMatcher` 场景。第二种是 API 名直接换掉，比如 `ChangeAPIMatcher`。第三种是 API 结构不变，但参数名要改、Paddle 端要补默认值，或者需要声明一组不支持参数，这类通常落在 `GenericMatcher`，`torch.optim.SGD` 就是典型例子。
+## 3. mapping 不够时复用 matcher
 
-这时你主要会改这些字段：`Matcher`、`paddle_api`、`args_list`、`min_input_args`、`kwargs_change`、`unsupport_args`、`paddle_default_kwargs`。如果你的需求已经能完整写进这几个字段，基本没必要再下探一层。
+`paconvert/api_matcher.py` 适合带着需求搜，不适合从头翻。多个 torch 参数共同决定一个 paddle 参数、输出要变多行、要临时变量、要 `paddle.assign(...)`、要 helper 函数、要处理 `*args` / `**kwargs`，这些都超过了纯 JSON 字段。
 
-## 什么时候该写或改 matcher
+能用已有 matcher 就复用。开始在脑子里拼输出模板时，再考虑新 matcher。
 
-当 JSON 已经表达不完需求时，再去 `paconvert/api_matcher.py`。最常见的信号不是“这条 API 很复杂”，而是你已经没法只靠字段描述输出形态了。
+新 matcher 需要 helper 时走 `BaseMatcher.enable_utils_code()`，不要在单个转换点直接写文件；落盘由 `UtilsFileHelper.write_code()` 统一处理。
 
-比如多个 torch 参数要一起决定一个 paddle 参数，或者输出不再是一句函数调用，而是多句代码、临时变量、`paddle.assign(...)`、helper 函数、`*args` / `**kwargs` 特判，这些都更像 matcher 该做的事。类方法如果还依赖 `self.paddleClass` 来决定接收者，也通常会落到 matcher。
+## 4. transformer 是最后手段
 
-一个很实用的判断是：如果你脑子里想的还是“把某几个 kwargs rename 一下”，先别写 matcher；如果你已经开始想输出模板字符串，说明这条规则大概率超出 mapping 能力了。
+`paconvert/transformer/basic_transformer.py` 和 `paconvert/transformer/import_transformer.py` 处理的是识别框架，不是单条 API 的常规入口。
 
-## 什么时候才需要碰 transformer
+import 被误判、本地模块被当成 torch 生态、alias 没进 `imports_map`、类方法和属性访问边界错了，才考虑动 transformer。`paconvert/transformer/tensor_requires_grad_transformer.py` 当前不在默认链路里，修相关行为时不能假设改它就生效。
 
-这属于少数情况。只有当问题已经不是“怎么改写”，而是“系统压根没认出来”时，才值得去 `transformer/` 目录找答案。
+## 5. 测试和校验
 
-常见场景包括：import 被误判，本地模块被当成 torch 生态删掉；某种 alias 没进 `imports_map`，导致 canonical API 恢复失败；类方法或属性访问的边界判断错了；或者你需要跨节点、跨作用域插语句，matcher 这一层已经不够表达。
+`tests/test_<api>.py` 至少补最小支持 case、全 kwargs、kwargs 乱序、默认参数省略；有明确不支持边界时补 `unsupport=True`。`tools/validate_unittest/validate_unittest.py` 会卡这些调用形态。
 
-这里顺手再提醒一次：`paconvert/transformer/tensor_requires_grad_transformer.py` 虽然存在，但当前默认链路没有接它。所以如果你是为了修 `requires_grad` 相关行为，不能先假设改这个文件就会生效。
+参数名、签名、`kwargs_change` 变了，要看 `tools/validate_docs/validate_docs.py`。输出源码形态变了，补 `tests/code_library/code_case/` 并看 `tools/consistency/consistency_check.py`。影响更像模型脚本，再看 `tests/code_library/model_case/`。
 
-## 测试怎么补，才算闭环
+`.github/PULL_REQUEST_TEMPLATE.md` 里的 `PR Docs`、`PR APIs` 也要填。维护者会用它快速定位这次改动影响了哪些 API 和文档。
 
-加一个普通 API，最低限度至少要补 `tests/test_<api>.py`。实际写的时候，更建议按调用形态补，而不是只写一个 happy path。
+单测失败先看转换后的临时文件，再看运行结果。很多 API 的问题出在 PaConvert 生成的源码形态，Paddle 结果不一致只是后面的表现。
 
-通常先有一个最小支持 case，再补一个全关键字 case、一个关键字乱序 case、一个依赖默认参数的 case。如果这条规则明确只支持一个子集，还要再补一个 `unsupport=True` 的 case。`tools/validate_unittest/validate_unittest.py` 盯的就是这类覆盖面：它会把测试里的调用形态反推回 `args_list` 和 `min_input_args`，缺一种常见写法都可能被卡住。
+## 最小行动清单
 
-如果你的改动影响的不只是“能不能跑通”，还影响输出代码长什么样，就继续补 `tests/code_library/code_case/`。这类样例比的是转换后的源码文本，不是运行结果。更大范围的模型级回归才会落到 `tests/code_library/model_case/`。
-
-## `validate_docs`、`validate_unittest` 和 CI 会在哪拦你
-
-`validate_unittest` 最常见的报错不是代码错，而是测试覆盖不完整。只写一个最小用例、没有全 kwargs、没有乱序 kwargs，或者 `args_list` 已经改了但测试形态没跟上，都会在这里暴露。
-
-`validate_docs` 看的是配置和文档是否对齐，不看代码能不能跑。`paddle_api`、`kwargs_change`、`args_list` 这些字段一旦改了，文档侧如果没同步，往往这里会先报。
-
-CI 里能直接看到的是 `.github/workflows_origin/tests.yml`、`lint.yml`、`coverage.yml`。另外 `scripts/` 和 `docs/CONTRIBUTING.md` 还提到 `modeltest`、`consistency`、`install`、`PRTemplate`。对一个新增 API 来说，PR 前最常挂的通常是三类问题：行为测试没过、覆盖率不够、代码样例文本和预期不一致。
-
-## 一个稳一点的动手顺序
-
-1. 在 `paconvert/api_mapping.json` 里找同类 API，先判断能不能复用现有 matcher。
-2. 只要 mapping 能表达，就先改 mapping；不够再去 `paconvert/api_matcher.py`。
-3. 立刻补 `tests/test_<api>.py`。
-4. 先跑这个单测文件，再跑 `tools/validate_unittest/validate_unittest.py -r tests/test_<api>.py`。
-5. 如果参数名、签名或 docs 映射受影响，再看 `tools/validate_docs/validate_docs.py`。
-6. 如果输出源码形态也变了，补 `tests/code_library/code_case/`。
-
-## 最小改动清单
-
-支持一个普通难度的 API，常见闭环就是下面这几项：
-
-1. `paconvert/api_mapping.json`
-2. `tests/test_<api>.py`
-3. 必要时改 `paconvert/api_matcher.py`
-4. 必要时补 `tests/code_library/code_case/`
-5. 参数文档或 docs 映射受影响时，再补对应文档改动
-
-如果你发现自己已经准备去改 `paconvert/transformer/basic_transformer.py`、`paconvert/transformer/import_transformer.py` 或 `paconvert/base.py`，先停一下再确认一遍。那通常已经不是“补一条 mapping”，而是在改识别框架本身。
+1. 在 `paconvert/api_mapping.json` 找同类 API。
+2. mapping 能表达就只改 JSON；不够再碰 `paconvert/api_matcher.py`。
+3. 补 `tests/test_<api>.py`。
+4. 跑目标单测和 `tools/validate_unittest/validate_unittest.py -r tests/test_<api>.py`。
+5. 参数文档受影响时处理 `validate_docs`；源码文本受影响时补 `tests/code_library/code_case/`。
+6. 准备改 `basic_transformer.py`、`import_transformer.py`、`base.py` 前，重新确认问题确实是识别层问题。
